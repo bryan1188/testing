@@ -1,0 +1,7 @@
+SELECT tc.dbo.PIMANRELATION.puid,tc.dbo.PIMANRELATION.rprimary_objectc as rprimary_objectc,tc.dbo.PIMANRELATION.rsecondary_objectu as rsecondary_objectu, tc.dbo.PIMANRELATION.rsecondary_objectc as rsecondary_objectc, tc.dbo.PIMANRELATION.rrelation_typeu as rrelation_typeu, tc.dbo.PIMANRELATION.rrelation_typec as rrelation_typec,
+tc.dbo.PTD4SBMFORMSTORAGE.ptd4CommodityLevel1 as ruser_datau, tc.dbo.PIMANRELATION.rprimary_objectu as rprimary_objectu FROM tc.dbo.PIMANRELATION as test,tc.dbo.PFORM as kisks,tc.dbo.PTD4SBMFORMSTORAGE
+WHERE rprimary_objectu = ?LKP_PUID_S_PITEMREVISION? and tc.dbo.PIMANRELATION.rsecondary_objectu= tc.dbo.PFORM.puid and tc.dbo.PFORM.rdata_fileu=tc.dbo.PTD4SBMFORMSTORAGE.puid
+
+
+
+SELECT tc.dbo.PWORKSPACEOBJECT.pobject_name as pobject_name, tc.dbo.PWORKSPACEOBJECT.pobject_desc as pobject_desc, tc.dbo.PWORKSPACEOBJECT.pobject_type as pobject_type, tc.dbo.PWORKSPACEOBJECT.pdate_released as pdate_released, tc.dbo.PWORKSPACEOBJECT.puid as puid FROM tc.dbo.PWORKSPACEOBJECT WHERE puid = ?LKP_PUID_S_PITEMREVISION? and pobject_type = 'TD4CommPartRevision' AND pdate_released IS NULL

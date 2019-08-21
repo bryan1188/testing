@@ -1,0 +1,43 @@
+ptsql_source 
+ptsql_TABLES 
+SYS.DBA_TAB_PARTITIONS 
+SYS.DBA_TAB_PARTITIONS 
+SYS.DBA_PART_TABLES 
+SYS.DBA_PART_KEY_COLUMNS 
+SYS.DBA_TAB_COLUMNS 
+SYS.DBA_TAB_COLUMNS 
+PTSQL_CLU_COLUMNS 
+PTSQL_CLUSTERS 
+SYS.DBA_TABLESPACES T 
+sys.dba_data_files f 
+sys.dba_constraints 
+sys.dba_cons_columns a
+sys.dba_cons_columns r 
+sys.dba_cons_columns 
+sys.dba_cons_columns a
+sys.dba_constraints b 
+sys.dba_constraints 
+sys.dba_indexes 
+sys.dba_ind_columns 
+SYS.DBA_PART_INDEXES 
+SYS.DBA_IND_PARTITIONS 
+sys.dba_triggers 
+sys.dba_sequences 
+sys.dba_views 
+sys.dba_tab_columns 
+sys.DBA_SNAPSHOT_LOGS sl
+PTSQL_TABLES t 
+SYS.DBA_SNAPSHOTS s
+SYS.DBA_TABLES t
+SYS.DBA_INDEXES i 
+ptsql_CLU_COLUMNS 
+sys.link$ dl
+sys.user$ u 
+sys.dba_synonyms 
+sys.undo$ un
+sys.seg$ s
+sys.ts$ ts
+sys.v_$rollstat v 
+sys.dba_libraries 
+sys.dba_directories 
+SYS.DBA_PROFILES 

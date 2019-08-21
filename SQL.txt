@@ -1,0 +1,444 @@
+CREATE OR REPLACE PACKAGE CODER.PTSQL_CODE
+as
+    /* Array processing constants */
+
+	ROW_CHUNK CONSTANT NUMBER := 15; --Max number of array rows to output at a time
+    MAX_SRC_LEN CONSTANT NUMBER := 2000;
+    MAX_VARCHAR_LEN CONSTANT NUMBER := 32767;
+
+	/* Status values */
+    MORE_ROWS CONSTANT NUMBER := 1;
+    NO_MORE_ROWS CONSTANT NUMBER := 2;
+    FIRST_TIME CONSTANT NUMBER := 0;
+    NO_DATA CONSTANT NUMBER := -1;
+    V_BLOCK_SIZE_K NUMBER;
+
+	varCR_ASCII CONSTANT NUMBER := ASCII('
+');
+	varCR		CONSTANT CHAR := CHR(ASCII('
+'));
+
+	TYPE text_array IS TABLE OF VARCHAR2(2000) INDEX BY BINARY_INTEGER;
+    /* array of VARCHAR2(2000) to hold object code */
+
+	glob_array text_array;
+
+	/* subsidiary array for cleaning up of glob_array */
+
+	empty_glob_array text_array;
+
+	glob_array_size NUMBER;
+    cur_row_offset NUMBER;
+
+
+	/*  PACKAGES, PACKAGE BODIES, PROCEDURES, FUNCTIONS		*/
+     CURSOR get_exec_obj_specs (object_owner sys.dba_objects.owner%TYPE,
+                                object_name sys.dba_objects.object_name%TYPE,
+                object_type sys.dba_objects.object_type%TYPE) IS
+        SELECT text FROM ptsql_source
+        WHERE owner = object_owner
+        AND name = object_name
+        AND type = object_type
+        ORDER BY line;
+
+    /*                  TABLES               */
+
+	-- Info about non-partitioned table:
+    CURSOR get_tbl (t_name sys.dba_tables.table_name%TYPE,
+            		o_name sys.dba_tables.owner%TYPE) IS
+        SELECT tablespace_name, cluster_name, iot_name, pct_free, pct_used,
+            ini_trans, max_trans, initial_extent, next_extent, min_extents,
+            max_extents, pct_increase, freelists, freelist_groups,
+		    logging, degree, instances, cache, partitioned, iot_type,
+            table_type_owner, table_type, nested, cluster_owner
+        FROM ptsql_TABLES
+        WHERE table_name = t_name
+        AND owner = o_name;
+
+	-- Info per table partition:
+    CURSOR get_tbl_part (t_name sys.dba_tab_partitions.table_name%TYPE,
+            			 o_name sys.dba_tab_partitions.table_owner%TYPE) IS
+        SELECT partition_name, high_value, high_value_length,
+		partition_position, tablespace_name, pct_free, pct_used, ini_trans,
+		max_trans, initial_extent, next_extent, min_extent,
+		max_extent, pct_increase, freelists, freelist_groups, logging, buffer_pool
+        FROM SYS.DBA_TAB_PARTITIONS
+        WHERE table_owner = o_name
+        AND table_name = t_name
+		ORDER BY partition_position;
+
+	-- Info about individual table partition:
+    CURSOR get_tbl_part_by_name(t_name sys.dba_tab_partitions.table_name%TYPE,
+            			o_name sys.dba_tab_partitions.table_owner%TYPE,
+						p_name sys.dba_tab_partitions.partition_name%TYPE) IS
+        SELECT partition_name, high_value, high_value_length,
+		partition_position, tablespace_name, pct_free, pct_used, ini_trans,
+		max_trans, initial_extent, next_extent, min_extent,
+		max_extent, pct_increase, freelists, freelist_groups, logging, buffer_pool
+        FROM SYS.DBA_TAB_PARTITIONS
+        WHERE table_owner = o_name
+        AND table_name = t_name
+		AND partition_name = p_name;
+
+	-- Info about default partition:
+    CURSOR get_part_tbl (t_name SYS.DBA_PART_TABLES.TABLE_NAME%TYPE,
+                o_name SYS.DBA_PART_TABLES.OWNER%TYPE) IS
+		SELECT OWNER, TABLE_NAME, PARTITION_COUNT, PARTITIONING_KEY_COUNT,
+		DEF_TABLESPACE_NAME, DEF_PCT_FREE, DEF_PCT_USED, DEF_INI_TRANS,
+		DEF_MAX_TRANS,
+		decode(DEF_INITIAL_EXTENT,'DEFAULT',5,DEF_INITIAL_EXTENT) init_ext,
+        decode(DEF_NEXT_EXTENT,'DEFAULT',5,DEF_NEXT_EXTENT) next_ext,
+		decode(DEF_MIN_EXTENTS,	'DEFAULT',1,DEF_MIN_EXTENTS) min_ext,
+        decode(DEF_MAX_EXTENTS,'DEFAULT',121,DEF_MAX_EXTENTS) max_ext,
+        decode(DEF_PCT_INCREASE,'DEFAULT',50,DEF_PCT_INCREASE) pct_incr,
+        decode(DEF_FREELISTS,0,1,DEF_FREELISTS) flists,
+        decode(DEF_FREELIST_GROUPS,0,1,DEF_FREELIST_GROUPS) flistgroups,
+        PARTITIONING_TYPE,
+        decode(DEF_LOGGING,'YES','LOGGING','NOLOGGING') logg,
+        DEF_BUFFER_POOL
+        FROM SYS.DBA_PART_TABLES
+		WHERE TABLE_NAME = t_name
+		AND	  OWNER = o_name;
+    -- Info about partition keys. Good for both Tables and Indexes:
+	CURSOR get_part_key (t_name SYS.DBA_PART_KEY_COLUMNS.NAME%TYPE,
+            		o_name SYS.DBA_PART_KEY_COLUMNS.OWNER%TYPE) IS
+		SELECT column_name, column_position
+		FROM SYS.DBA_PART_KEY_COLUMNS
+		WHERE name = t_name
+		AND owner = o_name
+		ORDER BY column_position;
+	CURSOR get_length_col_name (t_name sys.dba_tables.table_name%TYPE,
+								o_name sys.dba_tables.owner%TYPE) IS
+	    SELECT length(column_name) ColNameLength
+	    FROM   SYS.DBA_TAB_COLUMNS
+        WHERE  table_name = t_name
+        AND    owner = o_name;
+    CURSOR get_tbl_cols (t_name sys.dba_tables.table_name%TYPE,
+			  			o_name sys.dba_tables.owner%TYPE) IS
+        SELECT column_name, data_type, data_length, data_precision,
+        	   data_scale, nullable, data_default
+        FROM  SYS.DBA_TAB_COLUMNS
+        WHERE table_name = t_name
+        AND   owner = o_name
+        ORDER BY column_id;
+
+    CURSOR get_clu_cols (c_name VARCHAR2, o_name VARCHAR2, t_name varchar2) IS
+		SELECT tab_column_name
+        FROM PTSQL_CLU_COLUMNS
+        WHERE owner = o_name
+        AND cluster_name = c_name
+		and table_name = t_name
+        ORDER BY position;
+
+    /*                 CLUSTERS                 */
+    CURSOR get_cluster (cl_owner sys.dba_tables.owner%TYPE,
+            cl_name sys.dba_clusters.cluster_name%TYPE) IS
+        SELECT tablespace_name, pct_free, pct_used,
+        ini_trans, max_trans, initial_extent, next_extent,
+        min_extents, max_extents, pct_increase, degree,
+        instances, cache, key_size, cluster_type, function, hashkeys,
+        FREELISTS, FREELIST_GROUPS
+        FROM PTSQL_CLUSTERS
+        WHERE owner = cl_owner
+        AND cluster_name = cl_name;
+
+    /*                 TABLESPACES                 */
+    CURSOR get_tablespace (ts_name sys.dba_tablespaces.tablespace_name%TYPE) IS
+        SELECT t.initial_extent, t.next_extent, t.min_extents,
+		t.max_extents, t.pct_increase, t.min_extlen, t.contents, t.logging
+        from SYS.DBA_TABLESPACES T
+        where t.tablespace_name = ts_name;
+   CURSOR get_datafiles(ts_name sys.dba_tablespaces.tablespace_name%TYPE) IS
+        SELECT f.file_name, f.bytes, f.autoextensible, f.maxbytes, f.maxblocks,	f.increment_by
+        from sys.dba_data_files f
+        where f.tablespace_name = ts_name;
+
+    /*                CONSTRAINTS            */
+    CURSOR get_table_cons (t_name sys.dba_constraints.table_name%TYPE,
+                o_name sys.dba_constraints.owner%TYPE,
+				c_name sys.dba_constraints.constraint_name%TYPE) IS
+        SELECT constraint_name, constraint_type,
+        search_condition, r_owner, r_constraint_name, delete_rule,
+		deferrable, deferred, generated, bad, last_change, status
+        from sys.dba_constraints
+        where owner = o_name
+        and table_name = t_name
+		and constraint_name like c_name;
+
+   CURSOR get_forkey_cons (o_name sys.dba_cons_columns.owner%TYPE,
+                c_name sys.dba_cons_columns.constraint_name%TYPE,
+                ro_name sys.dba_cons_columns.owner%TYPE,
+                rc_name sys.dba_cons_columns.constraint_name%TYPE) IS
+        SELECT a.column_name colname, r.column_name r_colname, r.table_name r_tablename
+        from sys.dba_cons_columns a,
+        sys.dba_cons_columns r
+        where a.owner = o_name
+        and r.owner = ro_name
+        and a.constraint_name = c_name
+        and r.constraint_name = rc_name
+        and a.position = r.position;
+    CURSOR get_cons_cols (c_name sys.dba_cons_columns.constraint_name%TYPE,
+                t_name sys.dba_cons_columns.table_name%TYPE,
+                o_name sys.dba_cons_columns.owner%TYPE) IS
+        SELECT column_name
+        from sys.dba_cons_columns
+        where OWNER = o_name
+        and TABLE_NAME = t_name
+        and constraint_name = c_name
+        order by position;
+
+	CURSOR get_constraint_name (t_name sys.dba_cons_columns.table_name%TYPE,
+                o_name sys.dba_cons_columns.owner%TYPE,
+				col_name sys.dba_cons_columns.constraint_name%TYPE) IS
+        SELECT a.constraint_name constr_name, b.constraint_type constr_type, b.search_condition constr_condition
+        from sys.dba_cons_columns a, sys.dba_constraints b
+        where a.OWNER = o_name
+        and a.table_name = t_name
+        and a.column_name = col_name
+		and a.constraint_name = b.constraint_name
+		and a.table_name = b.table_name
+		and a.owner = b.owner;
+
+    CURSOR get_with_check_cons (viewowner sys.dba_views.owner%TYPE,
+                    viewname sys.dba_views.view_name%TYPE) IS
+        SELECT constraint_name
+        FROM sys.dba_constraints
+        WHERE owner = viewowner
+        AND table_name = viewname
+        AND constraint_type = 'V'
+        AND constraint_name not like 'SYS_C%';  --avoid system-defined names
+
+
+    /*                   INDEXES                       */
+
+	-- Info about non-partitioned indexes
+    CURSOR get_ind (i_name sys.dba_indexes.index_name%TYPE,
+                o_name sys.dba_indexes.owner%TYPE) IS
+        SELECT table_name, table_owner, table_type, index_type, uniqueness, tablespace_name,
+        ini_trans, max_trans, initial_extent, next_extent, min_extents,
+        max_extents, pct_increase, pct_free, freelists,
+		pct_threshold, include_column, partitioned, instances, logging, DEGREE
+        FROM sys.dba_indexes
+        WHERE index_name = i_name
+        AND owner = o_name;
+    CURSOR get_ind_cols (i_name sys.dba_indexes.index_name%TYPE,
+                o_name sys.dba_indexes.owner%TYPE) IS
+        SELECT column_name
+        FROM sys.dba_ind_columns
+        WHERE index_name = i_name
+        AND index_owner = o_name
+        ORDER BY column_position;
+	-- Info about default partitions
+    CURSOR get_part_ind (i_name SYS.ALL_PART_INDEXES.INDEX_NAME%TYPE,
+                o_name SYS.ALL_PART_INDEXES.OWNER%TYPE) IS
+		SELECT OWNER, INDEX_NAME, PARTITION_COUNT, PARTITIONING_KEY_COUNT,
+		DEF_PCT_FREE, DEF_INI_TRANS, DEF_MAX_TRANS,	DEF_INITIAL_EXTENT,
+		DEF_NEXT_EXTENT, DEF_MIN_EXTENTS, DEF_MAX_EXTENTS, DEF_PCT_INCREASE,
+		DEF_FREELISTS, LOCALITY, ALIGNMENT,	DEF_TABLESPACE_NAME,
+		PARTITIONING_TYPE, DEF_BUFFER_POOL
+		FROM  SYS.DBA_PART_INDEXES
+		WHERE INDEX_NAME = i_name
+		AND   OWNER = o_name;
+	-- Info about eaach partition of the part. index
+    CURSOR get_ind_part (i_name SYS.DBA_IND_PARTITIONS.INDEX_NAME%TYPE,
+                o_name SYS.DBA_IND_PARTITIONS.INDEX_OWNER%TYPE) IS
+		SELECT INDEX_OWNER,	INDEX_NAME,	HIGH_VALUE_LENGTH, PARTITION_POSITION,
+		TABLESPACE_NAME, PCT_FREE, INI_TRANS, MAX_TRANS, MIN_EXTENT, MAX_EXTENT,
+		PCT_INCREASE, INITIAL_EXTENT, NEXT_EXTENT, HIGH_VALUE, STATUS, PARTITION_NAME,
+		FREELISTS, BLEVEL, LEAF_BLOCKS, DISTINCT_KEYS, AVG_LEAF_BLOCKS_PER_KEY,
+		AVG_DATA_BLOCKS_PER_KEY, CLUSTERING_FACTOR, NUM_ROWS, SAMPLE_SIZE, LAST_ANALYZED,
+		BUFFER_POOL, LOGGING
+		FROM SYS.DBA_IND_PARTITIONS
+		WHERE INDEX_NAME = i_name
+		AND INDEX_OWNER = o_name
+		ORDER BY partition_position;
+	-- Info about partitioned keys see in Tables section: get_part_key()
+
+    /*                                    TRIGGERS            */
+    CURSOR get_triggers (o_name sys.dba_triggers.owner%TYPE,
+                trig_name sys.dba_triggers.trigger_name%TYPE) IS
+        SELECT description, substr(when_clause, 1, length(when_clause)-1) when_clause, trigger_body
+        from sys.dba_triggers
+        where trigger_name = trig_name
+        and owner = o_name;
+    /*                                     SEQUENCES           */
+    CURSOR get_sequences (seq_owner sys.dba_sequences.sequence_owner%TYPE,
+                seq_name sys.dba_sequences.sequence_name%TYPE) IS
+        SELECT min_value, max_value, increment_by, cycle_flag, order_flag,
+        cache_size, last_number
+        FROM sys.dba_sequences
+        WHERE sequence_owner = seq_owner
+        AND sequence_name = seq_name;
+    /*                                   VIEWS                  */
+    CURSOR get_views (viewowner sys.dba_views.owner%TYPE,
+                viewname sys.dba_views.view_name%TYPE) IS
+        SELECT text_length, text
+        FROM sys.dba_views
+        WHERE owner = viewowner
+        AND view_name = viewname;
+    CURSOR get_view_cols (t_name sys.dba_tables.table_name%TYPE,
+            o_name sys.dba_tables.owner%TYPE) IS
+        SELECT column_name
+        FROM sys.dba_tab_columns
+        WHERE table_name = t_name
+        AND owner = o_name
+        ORDER BY column_id;
+    /*                        SNAPSHOT LOGS        */
+    CURSOR get_snap_log ( p_name sys.dba_SNAPSHOT_LOGS.master%TYPE,
+                p_owner sys.dba_SNAPSHOT_LOGS.log_owner%TYPE ) IS
+        select sl.master, t.pct_free,
+        t.pct_used, decode(t.ini_trans, 1, 2, t.ini_trans) ini_trans, t.max_trans,
+        t.tablespace_name, t.initial_extent, t.next_extent, t.min_extents,
+        t.max_extents, t.pct_increase
+        from sys.DBA_SNAPSHOT_LOGS sl, PTSQL_TABLES t
+        where sl.log_owner = p_owner
+        and sl.log_table = p_name
+        and sl.log_table = t.table_name;
+    /*                    SNAPSHOTS            */
+    CURSOR get_snapshot ( p_name sys.dba_SNAPSHOTS.name%TYPE,
+                    p_owner sys.dba_SNAPSHOTS.owner%TYPE ) IS
+        select s.owner, s.name, t.pct_free tab_pct_free, t.pct_used,
+        decode(t.ini_trans, 1, 2, t.ini_trans) tab_ini_trans,
+        t.max_trans tab_max_trans, t.tablespace_name, t.initial_extent,
+        t.next_extent, t.min_extents, t.max_extents, t.pct_increase,
+        i.pct_free, i.ini_trans, i.max_trans,
+        s.type, s.start_with, s.next, s.updatable, s.query
+        from SYS.DBA_SNAPSHOTS s, SYS.DBA_TABLES t, SYS.DBA_INDEXES i
+        where s.name = p_name
+        and s.owner = p_owner
+        and s.table_name = t.table_name (+)
+        and s.table_name = i.table_name (+);
+    CURSOR get_snap_clu_cols ( p_name sys.dba_SNAPSHOTS.name%TYPE,
+                    p_owner sys.dba_SNAPSHOTS.owner%TYPE ) IS
+        SELECT cluster_name, tab_column_name
+        FROM ptsql_CLU_COLUMNS
+        WHERE owner = p_owner
+        AND table_name = 'SNAP$_' || substr( p_name, 1, 20)
+        order by position;
+    /*                         DB_LINKS                */
+    CURSOR get_db_link ( p_Owner sys.dba_objects.owner%TYPE,
+                    p_Link_Name sys.dba_db_links.db_link%TYPE) IS
+        select dl.userid, dl.password, dl.host
+        from sys.link$ dl, sys.user$ u
+        where dl.name = p_Link_Name
+        and u.name = p_Owner
+        and u.user# = dl.owner#;
+    /*                                SYNONYMS                  */
+    CURSOR get_synonyms (synowner sys.dba_synonyms.owner%TYPE,
+                synname sys.dba_synonyms.synonym_name%TYPE) IS
+        SELECT table_owner, table_name, db_link
+        from sys.dba_synonyms
+        where synonym_name = synname
+        and owner = synowner;
+    /*                ROLLBACK    SEGMENT                */
+    CURSOR get_rlb_seg( p_Name sys.dba_ROLLBACK_SEGS.segment_name%TYPE ) IS
+        select un.name roll_name, ts.name ts_name,
+        s.iniexts * ts.blocksize roll_initial, s.extsize * ts.blocksize roll_next,
+        s.minexts, s.maxexts, v.optsize
+        from sys.undo$ un, sys.seg$ s, sys.ts$ ts, sys.v_$rollstat v
+        where un.name = p_Name
+        and un.status$ != 1
+        and un.file# = s.file#
+        and un.block# = s.block#
+        and s.type# = 1
+        and s.ts# = ts.ts#
+        and un.us# = v.usn(+);
+
+	/*				LIBRARIES				*/
+	CURSOR get_lib (libowner sys.dba_libraries.owner%type,
+						libname sys.dba_libraries.library_name%type) IS
+		select file_spec, dynamic, status
+		from sys.dba_libraries
+		where owner = libowner
+		and	library_name = libname;
+
+	/*				DIRECTORIES				*/
+	CURSOR get_dir (dirname sys.dba_directories.directory_name%type) IS
+		select directory_path
+		from sys.dba_directories
+		where directory_name = dirname;
+
+	/*	PROFILES											*/
+	CURSOR get_profile (name IN SYS.DBA_PROFILES.PROFILE%TYPE)IS
+		SELECT RESOURCE_NAME, RESOURCE_TYPE, LIMIT
+		FROM SYS.DBA_PROFILES
+		WHERE PROFILE = name
+		ORDER BY RESOURCE_NAME;
+
+    /*            CURSOR VARIABLES        */
+    view_row        get_views%ROWTYPE;
+
+	tbl_row         get_tbl%ROWTYPE;
+
+	cluster_row        get_cluster%ROWTYPE;
+
+	tablespace_row        get_tablespace%ROWTYPE;
+
+	tab_clu_col_row        get_clu_cols%ROWTYPE;
+
+	tbl_col_row        get_tbl_cols%ROWTYPE;
+    tbl_col_row_NULL   get_tbl_cols%ROWTYPE;
+
+	tab_cons_row        get_table_cons%ROWTYPE;
+
+	cons_col_row        get_cons_cols%ROWTYPE;
+
+	ind_row            get_ind%ROWTYPE;
+	ind_row_NULL	   get_ind%ROWTYPE;
+
+    ind_col_row        get_ind_cols%ROWTYPE;
+
+	trigger_row        get_triggers%ROWTYPE;
+
+	seq_row            get_sequences%ROWTYPE;
+
+	syn_row            get_synonyms%ROWTYPE;
+
+	snap_row           get_snapshot%ROWTYPE;
+
+	snap_clu_col_row      get_snap_clu_cols%ROWTYPE;
+
+	snap_log_row       get_snap_log%ROWTYPE;
+
+	db_link_row        get_db_link%ROWTYPE;
+
+	rlb_seg_row        get_rlb_seg%ROWTYPE;
+
+	fk_row            get_forkey_cons%ROWTYPE;
+
+    /*****************************************/
+	/*        INTERFACE FUNCTIONS			 */
+	/*****************************************/
+    PROCEDURE get_object_code ( schemaname	IN	sys.dba_objects.owner%TYPE,
+								objectname	IN	VARCHAR2, -- varchar2 is here for special cases when more then single name is send
+															  -- specificaly, for partitions where table_name.partition_name is send.
+								objecttype	IN	sys.dba_objects.object_type%TYPE,
+								status		IN	OUT	NUMBER,
+								text_rows	OUT text_array,
+								doPhysical	IN	NUMBER,
+								doOwner		IN	NUMBER	DEFAULT 1,
+								doForeignKey IN	NUMBER	DEFAULT 1,
+								doPrimaryUniqueKey	IN NUMBER DEFAULT 1,
+								doColumnLevelNotNull IN NUMBER DEFAULT 1);
+
+	PROCEDURE get_primary_or_unique_key(schemaname IN sys.dba_tables.owner%TYPE,
+            TableDotKeyName IN VARCHAR2,
+            doPhysical IN NUMBER DEFAULT 1,
+			doOwner IN NUMBER DEFAULT 1,
+			str_len OUT NUMBER,
+	        alterstatement OUT VARCHAR2);
+
+	PROCEDURE get_foreign_key(schemaname IN sys.dba_tables.owner%TYPE,
+            TableDotKeyName IN VARCHAR2,
+            doOwner IN NUMBER DEFAULT 1,
+			str_len OUT NUMBER,
+	        alterstatement OUT VARCHAR2);
+
+	PROCEDURE get_check_key(schemaname IN sys.dba_tables.owner%TYPE,
+            TableDotKeyName IN VARCHAR2,
+			doOwner IN NUMBER DEFAULT 1,
+            str_len OUT NUMBER,
+	        alterstatement OUT VARCHAR2);
+
+end PTSQL_CODE;
+/
